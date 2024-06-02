@@ -1,0 +1,290 @@
+import time
+start_time = time.time()
+
+import RPi.GPIO as GPIO
+import math
+
+import paho.mqtt.client as mqtt
+
+GPIO.setmode(GPIO.BCM)
+
+
+
+Dispence_pin = 10
+water_pin = 11
+heating_pin = 12
+SMOKE_PIN = 2
+GPIO.setup(Dispence_pin, GPIO.OUT)
+GPIO.setup(water_pin, GPIO.OUT)
+GPIO.setup(heating_pin, GPIO.OUT)
+GPIO.setup(SMOKE_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+
+#these pins power components through an PNP transistor in this prototype, so they need to stay high to block the flow of current
+
+def pre_cleanup():
+#used prior to any call to GPIO.
+    GPIO.output(Dispence_pin, GPIO.HIGH)
+    GPIO.output(water_pin, GPIO.HIGH)
+    GPIO.output(heating_pin, GPIO.HIGH)
+#setup
+
+def hx711_Setup():
+    cup_weight = 2
+    from hx711 import HX711
+    global hx
+    hx = HX711(dout_pin=6, pd_sck_pin=5)
+    global starting_weight
+    starting_weight = hx.get_raw_data_mean()
+    starting_weight = math.floor(starting_weight/10000)+19
+    if starting_weight < cup_weight:
+        print("no cup detected... can't continue")
+        pre_cleanup()
+        GPIO.cleanup()
+        exit()
+    print("starting_weight: " + str(starting_weight))
+    
+    if starting_weight == False and isinstance(starting_weight, bool): #this hx711 library returns false if the load cell is disconnected from the Pi, in which case we quit the program.
+        print("the hx711 may have been disconnected...")
+        pre_cleanup()
+        GPIO.cleanup()
+        exit()
+
+#if the measured weight is below the starting weight, it could indicate the cup has fallen over.
+
+def getWeight():
+    print("Getting Weight...")
+    try:
+        weight = hx.get_raw_data_mean()
+        weight = math.floor(weight/10000)+19
+
+        print(weight)
+    except RuntimeError as error:
+       print(err.args[0])
+    
+    if weight < starting_weight: 
+        print("weight less than starting_weight... something's gone wrong")
+        pre_cleanup()
+        GPIO.cleanup()
+        exit()
+    elif starting_weight == False and isinstance(starting_weight, bool): #this hx711 library returns false if the load cell is disconnected from the Pi, in which case we quit the program.
+        print("the hx711 may have been disconnected...")
+        pre_cleanup()
+        GPIO.cleanup()
+        exit()
+    return weight
+
+
+def dht11_Setup():
+    import adafruit_dht
+    import board
+    global dhtDevice
+    dhtDevice = adafruit_dht.DHT11(board.D18)
+    global initial_temp
+    time.sleep(5)
+    initial_temp = dhtDevice.temperature
+    print("initial temp:")
+    print(initial_temp)
+    
+#if the temperature exceeds a safe temperature then the program closes, or if there is an issue with the connection resulting in an exception
+#returns DHT11 temp value if the safety conditions are met.
+#will make a second attempt at reading temp if one attempt fails.
+
+def checkTemp():
+    max_allowable_heat = initial_temp + 2
+
+    
+    i=1
+    while(i <= 2):
+        
+        try:
+            print("check temp")
+            temp = dhtDevice.temperature
+            
+            break
+        except RuntimeError as error:
+            # Errors happen fairly often, DHT's are hard to read, just keep going
+            print(error.args[0])
+            time.sleep(2.0)
+            if i == 1:
+                print("checkTemp inital failure... one more attempt...")
+        except Exception as error:
+            print(error.args[0])
+            dhtDevice.exit()
+            pre_cleanup()
+            GPIO.cleanup()
+            raise error
+    else:
+        print("both attempts failed, too risky to continue. Aborting program...")
+        
+    if temp > max_allowable_heat:
+        print("excess heat detected")
+        pre_cleanup()
+        GPIO.cleanup()
+        dhtDevice.exit()
+        exit()
+    print(temp)
+    return temp
+
+
+#checks for the presence of smoke and terminates the program if smoke is detected. no need to return the value
+    
+
+def checkSmoke():
+    try:
+        smoke_present = GPIO.input(SMOKE_PIN)
+    except RuntimeError as error:
+        print(err.args[0])
+    if smoke_present == GPIO.LOW:
+        print("smoke detected!! aborting program")
+        pre_cleanup()
+        GPIO.cleanup()
+        exit()
+
+    
+
+def Dispence_teabags():
+    
+        GPIO.output(Dispence_pin, GPIO.LOW)
+        time.sleep(0.5)
+        GPIO.output(Dispence_pin, GPIO.HIGH)
+        
+min_weight = 6
+max_weight = 7
+#the minimum and maximum amount of water that needs to be in the cup for a safe boil (TBD)
+
+#starts pumping water until the desired amount of water is in the cup or the time limit is reached
+#we also want to check for a change in the cup weight. if the weight ins't changing during the fillCup routine, it could mean the pipe has been displaced, or we need to refill the water.
+def Fill_Cup():
+    pump_start_time = time.time()
+    #a time limit of 20 seconds. it will stop filling the cup either when the time limit or weight limit has been exceeded.
+    print(start_time)
+    print(time.time())
+    while((time.time() - pump_start_time) < 20):
+        
+        GPIO.output(water_pin, GPIO.LOW)
+        weight_value = getWeight()
+        #stop once we have enough water
+        #
+        if(weight_value >= min_weight):
+            GPIO.output(water_pin, GPIO.HIGH)
+            break
+        elif(weight_value < starting_weight):
+            print("weight dropped below starting weight, ending program")
+            pre_cleanup()
+            GPIO.cleanup()
+            exit()
+        
+    GPIO.output(water_pin, GPIO.HIGH)
+    
+#activate the heating element until the time limit is reached or the the water weight has
+#dropped below min_weight due to evaporation
+    
+def Boil_Tea():
+    boil_time = 300
+    start_weight = getWeight()
+    if(start_weight < min_weight or start_weight > max_weight):
+        print("fillCup routine has failed. can't continue.")
+        pre_cleanup()
+        GPIO.cleanup()
+        exit()
+    start_boil_time = time.time()
+    boil_time = 300
+    while((time.time() - start_time) < boil_time):
+        
+        GPIO.output(heating_pin, GPIO.LOW)
+        checkSmoke()
+        checkTemp()
+        weight_value = getWeight()
+        if(weight_value < min_weight):
+           GPIO.output(heating_pin, GPIO.HIGH)
+           print("too much weight lost. must stop heating")
+           pre_cleanup()
+           GPIO.cleanup()
+           exit(0)
+        
+        
+    return
+           
+        
+        
+
+           
+#-----------------------
+def Make_Tea():
+    print("hx711 setup:")
+    hx711_Setup()
+    print()
+
+    print("dht11_Setup")
+    dht11_Setup()
+    
+    print()
+
+    print("sleep 10 seconds...")
+    time.sleep(3)
+    print()
+
+    print("Dispense_teabags()")
+    Dispence_teabags()
+    print()
+
+    print("sleep 10 seconds...")
+    time.sleep(3)
+    print()
+
+    print("fill cup:")
+    Fill_Cup()
+    print()
+
+    print("sleep 10 seconds...")
+    time.sleep(3)
+    print()
+
+    print("boiling tea")
+    Boil_Tea()
+    print()
+
+    print("DONE")
+    
+    pre_cleanup()
+    GPIO.cleanup()
+    exit()
+
+
+##FULL DISCLOSURE: this part of the program is mostly a copy and paste
+#not written by me. I asked chatGPT to give me a template for MQTT subcriptions on the RPi.
+import paho.mqtt.client as mqtt
+
+# Define the MQTT broker details
+broker = "broker.hivemq.com"  # Replace with your broker's address
+port = 1883  # Replace with your broker's port if different
+topic = "iphoneTea"  # Replace with the topic you want to subscribe to
+
+# Define the callback functions
+def on_connect(client, userdata, flags, rc):
+    print(f"Connected with result code {rc}")
+    client.subscribe(topic)
+
+def on_message(client, userdata, msg):
+    print(f"Received message: {msg.payload.decode()} on topic {msg.topic}")
+    Make_Tea()
+
+# Create an MQTT client instance
+client = mqtt.Client()
+
+# Attach the callback functions
+client.on_connect = on_connect
+client.on_message = on_message
+
+# Connect to the broker
+client.connect(broker, port, 60)
+
+# Start the loop to process received messages
+client.loop_forever()
+
+
+        
+            
+            
+
+            
